@@ -57,13 +57,13 @@ impl<'a> FtfParser<'a> {
         }
     }
 
-    fn read_transform(&self, r: &[u8], pos: &mut usize) -> Result<[i32; 6]> {
+    fn read_transform(&self, r: &[u8], pos: &mut usize) -> Result<([i32; 7], u8)> {
         if *pos >= r.len() {
             bail!("Unexpected EOF reading transform flags");
         }
         let v6 = r[*pos];
         *pos += 1;
-        let mut m = [64, 0, 0, 64, 0, 0];
+        let mut m = [64, 0, 0, 64, 0, 0, 64];
 
         let specs = [
             (1, 0, self.mode1),
@@ -72,6 +72,7 @@ impl<'a> FtfParser<'a> {
             (8, 3, self.mode1),
             (16, 4, self.mode2),
             (32, 5, self.mode2),
+            (64, 6, self.mode1),  // extra 参数
         ];
 
         for (bit, idx, mode) in specs {
@@ -81,11 +82,91 @@ impl<'a> FtfParser<'a> {
         }
         m[4] <<= 6;
         m[5] <<= 6;
-        Ok(m)
+        Ok((m, v6))
+    }
+
+    fn skip_extended_component(&self, r: &[u8], pos: &mut usize) -> Result<()> {
+        // 跳过扩展组件的元素列表（当 transform.flags & 0x80）
+        loop {
+            if *pos >= r.len() {
+                bail!("Unexpected EOF in extended component");
+            }
+            let v52 = r[*pos];
+            let mut _count = (v52 & 0x3F) as usize;
+            *pos += 1;
+
+            if (v52 & 0x40) != 0 {
+                if *pos >= r.len() {
+                    bail!("Unexpected EOF reading extended count");
+                }
+                _count |= (r[*pos] as usize) << 8;
+                *pos += 1;
+            }
+
+            if *pos >= r.len() {
+                bail!("Unexpected EOF reading element header");
+            }
+            let v56 = r[*pos];
+            *pos += 1;
+
+            let case = v56 >> 5;
+            let ngrp = (v56 & 7) as usize;
+
+            // 跳过 case 对应的数据
+            if case == 7 {
+                // full transform
+                let (_, _flags) = self.read_transform(r, pos)?;
+            } else if case == 2 || case == 3 || case == 6 {
+                // sx/sy/extra: mode1
+                Self::read_coord(r, pos, self.mode1)?;
+            } else if case == 4 || case == 5 {
+                // tx/ty: mode2 (will be <<6)
+                Self::read_coord(r, pos, self.mode2)?;
+            }
+
+            // 跳过 group 数据
+            for _ in 0..ngrp {
+                if *pos >= r.len() {
+                    bail!("Unexpected EOF in group");
+                }
+                let v74 = r[*pos];
+                *pos += 1;
+
+                if (v56 & 8) != 0 {
+                    // extended group index
+                    if *pos >= r.len() {
+                        bail!("Unexpected EOF in extended group index");
+                    }
+                    *pos += 1;
+                }
+
+                let cmode = v74 >> 6;
+                let w = (v74 >> 4) & 3;
+
+                // 跳过坐标数据
+                if cmode == 2 {
+                    if w == 0 {
+                        Self::read_coord(r, pos, self.mode2)?;
+                        Self::read_coord(r, pos, self.mode2)?;
+                    } else if w == 1 || w == 2 || w == 3 {
+                        Self::read_coord(r, pos, self.mode2)?;
+                    }
+                } else if cmode == 3 {
+                    Self::read_coord(r, pos, self.mode2)?;
+                    Self::read_coord(r, pos, self.mode2)?;
+                }
+            }
+
+            // 检查是否有更多元素
+            if (v52 & 0x80) == 0 {
+                break;
+            }
+        }
+        Ok(())
     }
 
     #[inline(always)]
-    fn apply_matrix(p: (i32, i32), m: &[i32; 6]) -> (i32, i32) {
+    fn apply_matrix(p: (i32, i32), m: &[i32; 7]) -> (i32, i32) {
         let (x, y) = p;
         (
             (m[0] * x + m[2] * y + m[4]) >> 6,
@@ -94,8 +175,9 @@ impl<'a> FtfParser<'a> {
     }
 
     fn raw_outline(&mut self, gid: usize) -> Result<Vec<SubRecord>> {
-        if gid >= self.loca_vals.len() - 1 {
-            bail!("GID {} out of range", gid);
+        if gid >= self.loca_vals.len() - 1 || gid >= self.memo.len() {
+            // 超出范围的 GID：返回空记录（与 Python 版本一致）
+            return Ok(Vec::new());
         }
         match self.state[gid] {
             GlyphState::Visiting => bail!("Glyph reference cycle detected at GID {}", gid),
@@ -152,7 +234,13 @@ impl<'a> FtfParser<'a> {
                         child_gid = (child_gid << 8) | (r[pos + 1 + i] as usize);
                     }
                     pos += 1 + nb;
-                    let m = self.read_transform(r, &mut pos)?;
+                    let (m, v6) = self.read_transform(r, &mut pos)?;
+
+                    // 如果 transform flags bit7 被设置，跳过扩展组件的元素列表
+                    if (v6 & 0x80) != 0 {
+                        self.skip_extended_component(r, &mut pos)?;
+                    }
+
                     let child_records = self.raw_outline(child_gid)?;
                     for rec in child_records {
                         let transformed_pts = rec
