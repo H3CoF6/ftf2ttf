@@ -5,6 +5,14 @@ edition = "2024"
 authors = ["H3CoF6"]
 description = "High-performance Tencent FTF font to standard TTF converter"
 
+[lib]
+name = "ftf2ttf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ftf2ttf"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
 rayon = "1.8"
