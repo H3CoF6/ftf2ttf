@@ -1,0 +1,12 @@
+[package]
+name = "ftf2ttf"
+version = "0.1.0"
+edition = "2024"
+authors = ["H3CoF6"]
+description = "High-performance Tencent FTF font to standard TTF converter"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+rayon = "1.8"
+anyhow = "1.0"
+walkdir = "2.4"
