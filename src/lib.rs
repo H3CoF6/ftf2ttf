@@ -459,15 +459,20 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
         bail!("Unsupported FTFH version: 0x{:X}", version);
     }
 
-    let loca_vals: Vec<usize> = loca_raw
+    let mut loca_vals: Vec<usize> = loca_raw
         .chunks_exact(4)
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]) as usize)
         .collect();
 
-    if loca_vals.len() != num_glyphs + 1 {
+    // 有些FTF文件的loca表缺少最后一个条目，需要自动添加
+    if loca_vals.len() == num_glyphs {
+        // loca表缺少最后一个条目，添加FTFG表的末尾作为最后一个条目
+        loca_vals.push(ftfg.len());
+    } else if loca_vals.len() != num_glyphs + 1 {
         bail!(
-            "loca entries ({}) mismatch with num_glyphs + 1 ({})",
+            "loca entries ({}) mismatch with num_glyphs or num_glyphs + 1 (expected {} or {})",
             loca_vals.len(),
+            num_glyphs,
             num_glyphs + 1
         );
     }
@@ -542,6 +547,10 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
     new_hhea[34..36].copy_from_slice(&num_glyphs_u16.to_be_bytes());
 
     let mut new_head = head_raw.to_vec();
+    // head表必须是54字节，如果原始FTF的head表更长则截断
+    if new_head.len() > 54 {
+        new_head.truncate(54);
+    }
     let (g_xmin, g_ymin, g_xmax, g_ymax) = global_bbox.unwrap_or((0, 0, 0, 0));
     new_head[8..12].copy_from_slice(&[0, 0, 0, 0]);
     new_head[36..38].copy_from_slice(&g_xmin.to_be_bytes());
