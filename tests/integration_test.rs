@@ -142,3 +142,18 @@ fn test_convert_22003() {
         println!("22003.ttf is already a normal TTF, skipping conversion test");
     }
 }
+
+#[test]
+fn test_convert_22001() {
+    let input = Path::new("resources/22001/22001.ttf");
+    assert!(input.exists(), "Test file resources/22001/22001.ttf not found");
+
+    let raw = fs::read(input).expect("Failed to read 22001.ttf");
+    assert!(is_ftf_font(&raw), "22001.ttf should be an FTF font");
+
+    let result = ftf2ttf::convert_ftf(&raw);
+    assert!(result.is_ok(), "Failed to convert 22001.ttf: {:?}", result.err());
+    let converted = result.unwrap();
+    assert!(!converted.is_empty(), "Converted file is empty");
+    assert!(converted.len() > 12, "Converted file too short");
+}

@@ -530,16 +530,18 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]) as usize)
         .collect();
 
-    // 有些FTF文件的loca表缺少最后一个条目，需要自动添加
+    // 处理loca表条目数与num_glyphs不匹配的情况
     if loca_vals.len() == num_glyphs {
         // loca表缺少最后一个条目，添加FTFG表的末尾作为最后一个条目
         loca_vals.push(ftfg.len());
-    } else if loca_vals.len() != num_glyphs + 1 {
+    } else if loca_vals.len() > num_glyphs + 1 {
+        // loca表条目数过多，截断到num_glyphs + 1
+        loca_vals.truncate(num_glyphs + 1);
+    } else if loca_vals.len() < num_glyphs {
         bail!(
-            "loca entries ({}) mismatch with num_glyphs or num_glyphs + 1 (expected {} or {})",
+            "loca entries ({}) is less than num_glyphs ({})",
             loca_vals.len(),
-            num_glyphs,
-            num_glyphs + 1
+            num_glyphs
         );
     }
 
