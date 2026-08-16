@@ -626,6 +626,7 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
     new_head[40..42].copy_from_slice(&g_xmax.to_be_bytes());
     new_head[42..44].copy_from_slice(&g_ymax.to_be_bytes());
     new_head[50..52].copy_from_slice(&1i16.to_be_bytes());
+    new_head[52..54].copy_from_slice(&0i16.to_be_bytes());
 
     let mut new_maxp = maxp_raw.to_vec();
     if new_maxp.len() >= 32 {
