@@ -88,3 +88,57 @@ fn test_convert_22004() {
     assert!(!converted.is_empty(), "Converted file is empty");
     assert!(converted.len() > 12, "Converted file too short");
 }
+
+#[test]
+fn test_convert_20183() {
+    let input = Path::new("resources/20183/20183.ttf");
+    assert!(input.exists(), "Test file resources/20183/20183.ttf not found");
+
+    let raw = fs::read(input).expect("Failed to read 20183.ttf");
+
+    if is_ftf_font(&raw) {
+        let result = ftf2ttf::convert_ftf(&raw);
+        assert!(result.is_ok(), "Failed to convert 20183.ttf: {:?}", result.err());
+        let converted = result.unwrap();
+        assert!(!converted.is_empty(), "Converted file is empty");
+        assert!(converted.len() > 12, "Converted file too short");
+    } else {
+        println!("20183.ttf is already a normal TTF, skipping conversion test");
+    }
+}
+
+#[test]
+fn test_convert_20268() {
+    let input = Path::new("resources/20268/20268.ttf");
+    assert!(input.exists(), "Test file resources/20268/20268.ttf not found");
+
+    let raw = fs::read(input).expect("Failed to read 20268.ttf");
+
+    if is_ftf_font(&raw) {
+        let result = ftf2ttf::convert_ftf(&raw);
+        assert!(result.is_ok(), "Failed to convert 20268.ttf: {:?}", result.err());
+        let converted = result.unwrap();
+        assert!(!converted.is_empty(), "Converted file is empty");
+        assert!(converted.len() > 12, "Converted file too short");
+    } else {
+        println!("20268.ttf is already a normal TTF, skipping conversion test");
+    }
+}
+
+#[test]
+fn test_convert_22003() {
+    let input = Path::new("resources/22003/22003.ttf");
+    assert!(input.exists(), "Test file resources/22003/22003.ttf not found");
+
+    let raw = fs::read(input).expect("Failed to read 22003.ttf");
+
+    if is_ftf_font(&raw) {
+        let result = ftf2ttf::convert_ftf(&raw);
+        assert!(result.is_ok(), "Failed to convert 22003.ttf: {:?}", result.err());
+        let converted = result.unwrap();
+        assert!(!converted.is_empty(), "Converted file is empty");
+        assert!(converted.len() > 12, "Converted file too short");
+    } else {
+        println!("22003.ttf is already a normal TTF, skipping conversion test");
+    }
+}

@@ -8,6 +8,11 @@ const Y_OFF: i32 = 92;
 struct SubRecord {
     points: Vec<(i32, i32)>,
     flags: Vec<u8>,
+    c1: usize,
+    c2: usize,
+    extra: Vec<u8>,
+    reverse: bool,
+    chain: [i32; 7],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +88,19 @@ impl<'a> FtfParser<'a> {
         m[4] <<= 6;
         m[5] <<= 6;
         Ok((m, v6))
+    }
+
+    #[inline(always)]
+    fn compose(parent: &[i32; 7], child: &[i32; 7]) -> [i32; 7] {
+        [
+            (parent[0] * child[0] + parent[2] * child[1]) >> 6,
+            (parent[1] * child[0] + parent[3] * child[1]) >> 6,
+            (parent[0] * child[2] + parent[2] * child[3]) >> 6,
+            (parent[1] * child[2] + parent[3] * child[3]) >> 6,
+            parent[4] + ((parent[0] * child[4] + parent[2] * child[5]) >> 6),
+            parent[5] + ((parent[1] * child[4] + parent[3] * child[5]) >> 6),
+            (parent[6] * child[6]) >> 6,
+        ]
     }
 
     fn skip_extended_component(&self, r: &[u8], pos: &mut usize) -> Result<()> {
@@ -217,10 +235,21 @@ impl<'a> FtfParser<'a> {
                     let flags = r[pos..pos + total].to_vec();
                     pos += total;
 
+                    let mut extra = Vec::new();
                     if c1 > 0 {
+                        if pos + c2 > r.len() { bail!("Corrupted extra bytes at GID {}", gid); }
+                        extra.extend_from_slice(&r[pos..pos + c2]);
                         pos += c2;
                     }
-                    out.push(SubRecord { points: pts, flags });
+                    out.push(SubRecord {
+                        points: pts,
+                        flags,
+                        c1,
+                        c2,
+                        extra,
+                        reverse: false,
+                        chain: [64, 0, 0, 64, 0, 0, 64],
+                    });
                     if (b0 & 0x40) == 0 {
                         break;
                     }
@@ -242,16 +271,10 @@ impl<'a> FtfParser<'a> {
                     }
 
                     let child_records = self.raw_outline(child_gid)?;
-                    for rec in child_records {
-                        let transformed_pts = rec
-                            .points
-                            .into_iter()
-                            .map(|p| Self::apply_matrix(p, &m))
-                            .collect();
-                        out.push(SubRecord {
-                            points: transformed_pts,
-                            flags: rec.flags,
-                        });
+                    for mut rec in child_records {
+
+                        rec.chain = Self::compose(&m, &rec.chain);
+                        out.push(rec);
                     }
                     if (b0 & 0x40) == 0 {
                         break;
@@ -269,18 +292,61 @@ impl<'a> FtfParser<'a> {
         let mut glyphs = Vec::with_capacity(num_glyphs);
         for gid in 0..num_glyphs {
             let recs = self.raw_outline(gid)?;
-            let mapped = recs
-                .into_iter()
-                .map(|rec| SubRecord {
-                    points: rec
-                        .points
-                        .into_iter()
-                        .map(|(x, y)| (x + X_OFF, Y_OFF - y))
-                        .collect(),
-                    flags: rec.flags,
-                })
-                .collect();
-            glyphs.push(mapped);
+            let mut mapped_recs = Vec::with_capacity(recs.len());
+
+            for rec in recs {
+                let m = rec.chain;
+                let c1 = rec.c1;
+                let c2 = rec.c2;
+                let extra_scale = m[6];
+
+                let mut o_pts = Vec::new();
+                let mut o_flags = Vec::new();
+
+                if c1 > 0 {
+                    let base: Vec<(i32, i32)> = rec.points[..c1]
+                        .iter()
+                        .map(|&p| Self::apply_matrix(p, &m))
+                        .collect();
+
+                    for i in 0..c2 {
+                        let (dx, dy) = rec.points[c1 + i];
+                        let ext_idx = rec.extra[i] as usize;
+                        if ext_idx >= base.len() { continue; } // 防止越界
+                        let (bx, by) = base[ext_idx];
+                        o_pts.push((
+                            bx + ((dx * extra_scale) >> 6),
+                            by + ((dy * extra_scale) >> 6),
+                        ));
+                    }
+                    o_flags.extend_from_slice(&rec.flags[c1..c1 + c2]);
+                } else {
+                    o_pts.extend(rec.points[..c2].iter().map(|&p| Self::apply_matrix(p, &m)));
+                    o_flags.extend_from_slice(&rec.flags[..c2]);
+                }
+
+                if rec.reverse {
+                    o_pts.reverse();
+                    o_flags.reverse();
+                }
+
+                if let Some(last) = o_flags.last_mut() {
+                    *last |= 0x80;
+                }
+
+                let final_pts = o_pts.into_iter().map(|(x, y)| (x + X_OFF, Y_OFF - y)).collect();
+
+                mapped_recs.push(SubRecord {
+                    points: final_pts,
+                    flags: o_flags,
+                    c1: 0,
+                    c2: rec.c2,
+                    extra: Vec::new(),
+                    reverse: false,
+                    chain: [64, 0, 0, 64, 0, 0, 64],
+                });
+            }
+            glyphs.push(mapped_recs);
         }
         Ok(glyphs)
     }
