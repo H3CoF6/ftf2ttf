@@ -753,6 +753,16 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
             tables_map.insert(b"head", new_head.clone());
         } else if *tag == b"maxp" {
             tables_map.insert(b"maxp", new_maxp.clone());
+        } else if *tag == b"post" {
+            // 修复 post 表：转换为 3.0 版本（无 glyph 名称），避免 numGlyphs 不匹配
+            if data.len() >= 32 {
+                let mut new_post = Vec::with_capacity(32);
+                new_post.extend_from_slice(&0x00030000u32.to_be_bytes()); // version 3.0
+                new_post.extend_from_slice(&data[4..32]); // 复制其余的基本字段
+                tables_map.insert(b"post", new_post);
+            } else if !data.is_empty() {
+                tables_map.insert(tag, data.to_vec());
+            }
         } else {
             // 跳过长度为 0 的表（OTS 不接受空表）
             if !data.is_empty() {
