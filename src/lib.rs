@@ -484,6 +484,103 @@ fn calc_table_checksum(data: &[u8]) -> u32 {
     sum
 }
 
+fn fix_normal_ttf(raw: &[u8]) -> Result<Vec<u8>> {
+    if raw.len() < 12 {
+        bail!("File too short to be a valid TTF");
+    }
+    let num_tables = u16::from_be_bytes([raw[4], raw[5]]) as usize;
+    if raw.len() < 12 + num_tables * 16 {
+        bail!("Corrupted table directory");
+    }
+
+    let mut orig_tables = HashMap::new();
+    let mut has_empty_table = false;
+
+    for i in 0..num_tables {
+        let off = 12 + i * 16;
+        let tag = &raw[off..off + 4];
+        let toff = u32::from_be_bytes([raw[off + 8], raw[off + 9], raw[off + 10], raw[off + 11]]) as usize;
+        let tlen = u32::from_be_bytes([raw[off + 12], raw[off + 13], raw[off + 14], raw[off + 15]]) as usize;
+        if toff + tlen > raw.len() {
+            bail!("Table {:?} points outside file boundary", std::str::from_utf8(tag));
+        }
+        let data = &raw[toff..toff + tlen];
+        if data.is_empty() {
+            has_empty_table = true;
+        }
+        orig_tables.insert(tag, data);
+    }
+
+    if !has_empty_table {
+        return Ok(raw.to_vec());
+    }
+
+    let mut tables_map: BTreeMap<&[u8], Vec<u8>> = BTreeMap::new();
+    for (tag, data) in &orig_tables {
+        if !data.is_empty() {
+            tables_map.insert(tag, data.to_vec());
+        }
+    }
+
+    let out_num_tables = tables_map.len() as u16;
+    let entry_selector = (out_num_tables as f64).log2().floor() as u16;
+    let search_range = (1 << entry_selector) * 16;
+    let range_shift = out_num_tables * 16 - search_range;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x00010000u32.to_be_bytes());
+    out.extend_from_slice(&out_num_tables.to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&entry_selector.to_be_bytes());
+    out.extend_from_slice(&range_shift.to_be_bytes());
+
+    let header_size = 12 + out_num_tables as usize * 16;
+    let mut current_offset = header_size;
+    let mut dir_entries = Vec::new();
+    let mut table_blobs = Vec::new();
+    let mut head_table_file_offset = 0;
+
+    for (tag, data) in tables_map {
+        let checksum = calc_table_checksum(&data);
+        let offset = current_offset as u32;
+        let length = data.len() as u32;
+
+        if tag == b"head" {
+            head_table_file_offset = offset as usize;
+        }
+
+        dir_entries.push((tag, checksum, offset, length));
+        table_blobs.push(data);
+
+        let padded_len = (length as usize + 3) & !3;
+        current_offset += padded_len;
+    }
+
+    for (tag, checksum, offset, length) in &dir_entries {
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&checksum.to_be_bytes());
+        out.extend_from_slice(&offset.to_be_bytes());
+        out.extend_from_slice(&length.to_be_bytes());
+    }
+
+    for blob in table_blobs {
+        out.extend_from_slice(&blob);
+        let rem = blob.len() % 4;
+        if rem != 0 {
+            out.extend_from_slice(&vec![0u8; 4 - rem]);
+        }
+    }
+
+    let whole_checksum = calc_table_checksum(&out);
+    let check_sum_adj = 0xB1B0AFBA_u32.wrapping_sub(whole_checksum);
+    if head_table_file_offset > 0 && head_table_file_offset + 12 <= out.len() {
+        out[head_table_file_offset + 8..head_table_file_offset + 12]
+            .copy_from_slice(&check_sum_adj.to_be_bytes());
+    }
+
+    Ok(out)
+}
+
 pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
     if raw.len() < 12 {
         bail!("File too short to be a valid TTF");
@@ -505,8 +602,13 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
         orig_tables.insert(tag, &raw[toff..toff + tlen]);
     }
 
-    let ftfh = orig_tables.get(b"FTFH".as_slice()).ok_or_else(|| anyhow!("FTFH table missing"))?;
-    let ftfg = orig_tables.get(b"FTFG".as_slice()).ok_or_else(|| anyhow!("FTFG table missing"))?;
+    // 如果没有 FTFH/FTFG 表，说明是正常 TTF，检查并修复空表问题
+    if !orig_tables.contains_key(b"FTFH".as_slice()) || !orig_tables.contains_key(b"FTFG".as_slice()) {
+        return fix_normal_ttf(raw);
+    }
+
+    let ftfh = orig_tables.get(b"FTFH".as_slice()).unwrap();
+    let ftfg = orig_tables.get(b"FTFG".as_slice()).unwrap();
     let loca_raw = orig_tables.get(b"loca".as_slice()).ok_or_else(|| anyhow!("loca table missing"))?;
     let hhea_raw = orig_tables.get(b"hhea".as_slice()).ok_or_else(|| anyhow!("hhea table missing"))?;
     let hmtx_raw = orig_tables.get(b"hmtx".as_slice()).ok_or_else(|| anyhow!("hmtx table missing"))?;
@@ -652,7 +754,10 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
         } else if *tag == b"maxp" {
             tables_map.insert(b"maxp", new_maxp.clone());
         } else {
-            tables_map.insert(tag, data.to_vec());
+            // 跳过长度为 0 的表（OTS 不接受空表）
+            if !data.is_empty() {
+                tables_map.insert(tag, data.to_vec());
+            }
         }
     }
     tables_map.insert(b"glyf", glyf_bytes);

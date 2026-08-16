@@ -22,44 +22,18 @@ struct Cli {
     recursive: bool,
 }
 
-fn is_normal_ttf(raw: &[u8]) -> bool {
-    if raw.len() < 12 {
-        return false;
-    }
-    let num_tables = u16::from_be_bytes([raw[4], raw[5]]) as usize;
-    if raw.len() < 12 + num_tables * 16 {
-        return false;
-    }
-
-    let mut has_ftfh = false;
-    let mut has_ftfg = false;
-
-    for i in 0..num_tables {
-        let off = 12 + i * 16;
-        if off + 4 > raw.len() {
-            break;
-        }
-        let tag = &raw[off..off + 4];
-        if tag == b"FTFH" {
-            has_ftfh = true;
-        }
-        if tag == b"FTFG" {
-            has_ftfg = true;
-        }
-    }
-
-    !has_ftfh && !has_ftfg
-}
 
 fn process_single_file(src: &Path, dst: &Path) -> Result<()> {
     let raw = fs::read(src).with_context(|| format!("Failed to read {:?}", src))?;
 
-    if is_normal_ttf(&raw) {
-        println!("Skipping {:?}: already a normal TTF", src.file_name().unwrap());
+    let converted = ftf2ttf::convert_ftf(&raw).with_context(|| format!("Failed to convert {:?}", src))?;
+
+    // 如果转换后的数据与原始数据相同，说明不需要修复
+    if converted == raw {
+        println!("Skipping {:?}: no issues found", src.file_name().unwrap());
         return Ok(());
     }
 
-    let converted = ftf2ttf::convert_ftf(&raw).with_context(|| format!("Failed to convert {:?}", src))?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
