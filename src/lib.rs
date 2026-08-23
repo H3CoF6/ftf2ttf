@@ -623,12 +623,22 @@ fn rebuild_cmap_table(cmap_raw: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
+    // 去重：多个编码记录可能共享同一份子表数据（原始字体用相同 offset 引用），
+    // 这里按内容去重，避免输出时子表被重复写入导致体积翻倍
     let header_len = 4 + new_recs.len() * 8;
     let mut cur = header_len;
+    let mut blob_offsets: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut offsets = Vec::with_capacity(new_recs.len());
+    let mut blob_order: Vec<&Vec<u8>> = Vec::new();
     for (_, _, data) in &new_recs {
-        offsets.push(cur);
-        cur += (data.len() + 3) & !3;
+        if let Some(&o) = blob_offsets.get(data) {
+            offsets.push(o);
+        } else {
+            blob_offsets.insert(data.clone(), cur);
+            offsets.push(cur);
+            blob_order.push(data);
+            cur += (data.len() + 3) & !3;
+        }
     }
 
     let mut out = Vec::with_capacity(cur);
@@ -639,7 +649,7 @@ fn rebuild_cmap_table(cmap_raw: &[u8]) -> Result<Vec<u8>> {
         out.extend_from_slice(&eid.to_be_bytes());
         out.extend_from_slice(&(o as u32).to_be_bytes());
     }
-    for (_, _, data) in &new_recs {
+    for data in blob_order {
         out.extend_from_slice(data);
         let rem = data.len() % 4;
         if rem != 0 {
@@ -953,25 +963,34 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
 
     // 修复 vmtx/vhea：重建 vmtx 使其长度覆盖全部字形
     // （否则 OTS 报 "vmtx: Failed to read side bearing"），并保持 numberOfVMetrics 一致。
-    let (new_vhea, new_vmtx) = if let (Some(vhea_raw), Some(vmtx_raw)) =
-        (orig_tables.get(b"vhea".as_slice()), orig_tables.get(b"vmtx".as_slice()))
-    {
-        if vhea_raw.len() >= 36 && !vmtx_raw.is_empty() {
+    let (new_vhea, new_vmtx) = match (
+        orig_tables.get(b"vhea".as_slice()),
+        orig_tables.get(b"vmtx".as_slice()),
+    ) {
+        (Some(vhea_raw), Some(vmtx_raw)) if vhea_raw.len() >= 36 && !vmtx_raw.is_empty() => {
+            // OTS 要求 vhea 版本为 0x00010000（部分魔改字体写成 0x00010001 会报
+            // "vhea: Unsupported table version"）
             let mut nvm = u16::from_be_bytes([vhea_raw[34], vhea_raw[35]]) as usize;
             let mut fixed_vhea = vhea_raw.to_vec();
+            fixed_vhea[0..4].copy_from_slice(&0x00010000u32.to_be_bytes());
             if nvm > num_glyphs {
                 nvm = num_glyphs;
                 fixed_vhea[34..36].copy_from_slice(&(nvm as u16).to_be_bytes());
             }
             (Some(fixed_vhea), Some(rebuild_vmtx_table(vmtx_raw, nvm, num_glyphs)))
-        } else {
-            (None, None)
         }
-    } else {
-        (None, None)
+        (Some(vhea_raw), _) if vhea_raw.len() >= 36 => {
+            // 无 vmtx 时仍修复 vhea 版本号
+            let mut fixed_vhea = vhea_raw.to_vec();
+            fixed_vhea[0..4].copy_from_slice(&0x00010000u32.to_be_bytes());
+            (Some(fixed_vhea), None)
+        }
+        _ => (None, None),
     };
 
     let mut new_hhea = hhea_raw.to_vec();
+    // OTS 要求 hhea 版本为 0x00010000
+    new_hhea[0..4].copy_from_slice(&0x00010000u32.to_be_bytes());
     let num_glyphs_u16 = num_glyphs as u16;
     new_hhea[34..36].copy_from_slice(&num_glyphs_u16.to_be_bytes());
 
