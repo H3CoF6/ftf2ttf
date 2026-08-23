@@ -581,6 +581,245 @@ fn fix_normal_ttf(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// 重建 cmap 表：修复 format 4 子表中多个 0xFFFF 终止段的问题
+/// （OTS 要求恰好一个以 0xFFFF 结尾的段，否则报
+/// "cmap: multiple 0xffff terminators found"）。
+fn rebuild_cmap_table(cmap_raw: &[u8]) -> Result<Vec<u8>> {
+    if cmap_raw.len() < 4 {
+        return Ok(cmap_raw.to_vec());
+    }
+    let version = u16::from_be_bytes([cmap_raw[0], cmap_raw[1]]);
+    let ntab = u16::from_be_bytes([cmap_raw[2], cmap_raw[3]]) as usize;
+    if cmap_raw.len() < 4 + ntab * 8 {
+        return Ok(cmap_raw.to_vec());
+    }
+
+    let mut recs: Vec<(u16, u16, usize)> = Vec::with_capacity(ntab);
+    let mut pos = 4;
+    for _ in 0..ntab {
+        let pid = u16::from_be_bytes([cmap_raw[pos], cmap_raw[pos + 1]]);
+        let eid = u16::from_be_bytes([cmap_raw[pos + 2], cmap_raw[pos + 3]]);
+        let off = u32::from_be_bytes([
+            cmap_raw[pos + 4],
+            cmap_raw[pos + 5],
+            cmap_raw[pos + 6],
+            cmap_raw[pos + 7],
+        ]) as usize;
+        recs.push((pid, eid, off));
+        pos += 8;
+    }
+
+    let mut new_recs: Vec<(u16, u16, Vec<u8>)> = Vec::with_capacity(ntab);
+    for (pid, eid, off) in recs {
+        if off >= cmap_raw.len() {
+            continue;
+        }
+        let sub = &cmap_raw[off..];
+        let fmt = if sub.len() >= 2 { u16::from_be_bytes([sub[0], sub[1]]) } else { 0xFFFF };
+        if fmt == 4 {
+            new_recs.push((pid, eid, rebuild_format4_subtable(sub)?));
+        } else {
+            new_recs.push((pid, eid, sub.to_vec()));
+        }
+    }
+
+    let header_len = 4 + new_recs.len() * 8;
+    let mut cur = header_len;
+    let mut offsets = Vec::with_capacity(new_recs.len());
+    for (_, _, data) in &new_recs {
+        offsets.push(cur);
+        cur += (data.len() + 3) & !3;
+    }
+
+    let mut out = Vec::with_capacity(cur);
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(&(new_recs.len() as u16).to_be_bytes());
+    for ((pid, eid, _), &o) in new_recs.iter().zip(&offsets) {
+        out.extend_from_slice(&pid.to_be_bytes());
+        out.extend_from_slice(&eid.to_be_bytes());
+        out.extend_from_slice(&(o as u32).to_be_bytes());
+    }
+    for (_, _, data) in &new_recs {
+        out.extend_from_slice(data);
+        let rem = data.len() % 4;
+        if rem != 0 {
+            out.extend_from_slice(&[0u8; 3][..4 - rem]);
+        }
+    }
+    Ok(out)
+}
+
+/// 重建 cmap format 4 子表：解码为 (码点 -> glyph) 映射后重新编码。
+/// 排除非字符 U+FFFF，并始终追加标准的纯终止段 [0xFFFF, 0xFFFF, 1]。
+/// 若表本身已满足 OTS 要求（恰好一个 0xFFFF 终止段且在末尾），则原样返回。
+fn rebuild_format4_subtable(sub: &[u8]) -> Result<Vec<u8>> {
+    if sub.len() < 14 {
+        return Ok(sub.to_vec());
+    }
+    let length = u16::from_be_bytes([sub[2], sub[3]]) as usize;
+    let seg_x2 = u16::from_be_bytes([sub[6], sub[7]]) as usize;
+    let segcount = seg_x2 / 2;
+    if length > sub.len() || segcount == 0 {
+        return Ok(sub.to_vec());
+    }
+    let end_off = 14usize;
+    let start_off = end_off + seg_x2 + 2; // reservedPad
+    let delta_off = start_off + seg_x2;
+    let range_off = delta_off + seg_x2;
+    let glyph_off = range_off + seg_x2;
+    if glyph_off > length {
+        return Ok(sub.to_vec());
+    }
+
+    // 若恰好一个 0xFFFF 终止段且在最后，则无需重建
+    let mut nffff = 0usize;
+    for i in 0..segcount {
+        let e = u16::from_be_bytes([sub[end_off + i * 2], sub[end_off + i * 2 + 1]]);
+        if e == 0xFFFF {
+            nffff += 1;
+        }
+    }
+    if nffff == 1 {
+        let last_end = u16::from_be_bytes([
+            sub[end_off + (segcount - 1) * 2],
+            sub[end_off + (segcount - 1) * 2 + 1],
+        ]);
+        if last_end == 0xFFFF {
+            return Ok(sub.to_vec());
+        }
+    }
+
+    // 解码 (码点 -> glyph) 映射，首个匹配的段优先
+    let mut mapping: BTreeMap<u16, u16> = BTreeMap::new();
+    let glyph_arr = &sub[glyph_off..length];
+    for i in 0..segcount {
+        let start = u16::from_be_bytes([sub[start_off + i * 2], sub[start_off + i * 2 + 1]]);
+        let end = u16::from_be_bytes([sub[end_off + i * 2], sub[end_off + i * 2 + 1]]);
+        let delta = i16::from_be_bytes([sub[delta_off + i * 2], sub[delta_off + i * 2 + 1]]);
+        let ro = u16::from_be_bytes([sub[range_off + i * 2], sub[range_off + i * 2 + 1]]);
+        if start > end {
+            continue;
+        }
+        if ro != 0 {
+            let base = range_off + i * 2 + ro as usize;
+            if base + 2 > length {
+                continue;
+            }
+            let idx = base - glyph_off;
+            for c in start..=end {
+                if c == 0xFFFF {
+                    continue; // 非字符，必须映射到 .notdef（由终止段处理）
+                }
+                let p = idx + (c as usize - start as usize) * 2;
+                if p + 2 > glyph_arr.len() {
+                    break;
+                }
+                let g = u16::from_be_bytes([glyph_arr[p], glyph_arr[p + 1]]);
+                if g != 0 {
+                    mapping.entry(c).or_insert(g);
+                }
+            }
+        } else {
+            for c in start..=end {
+                if c == 0xFFFF {
+                    continue;
+                }
+                let g = ((c as i32 + delta as i32) & 0xFFFF) as u16;
+                if g != 0 {
+                    mapping.entry(c).or_insert(g);
+                }
+            }
+        }
+    }
+
+    // 将连续码点且连续 glyph 的区间编码为一个段（idDelta 编码，idRangeOffset=0）
+    let mut segs: Vec<(u16, u16, i16)> = Vec::new();
+    {
+        let mut iter = mapping.iter();
+        if let Some((&c0, &g0)) = iter.next() {
+            let mut cur_start = c0;
+            let mut cur_g0 = g0 as i32;
+            let mut prev_c = c0;
+            let mut prev_g = g0 as i32;
+            for (&c, &g) in iter {
+                if c == prev_c + 1 && g as i32 == prev_g + 1 {
+                    prev_c = c;
+                    prev_g = g as i32;
+                } else {
+                    segs.push((cur_start, prev_c, (cur_g0 - cur_start as i32) as i16));
+                    cur_start = c;
+                    cur_g0 = g as i32;
+                    prev_c = c;
+                    prev_g = g as i32;
+                }
+            }
+            segs.push((cur_start, prev_c, (cur_g0 - cur_start as i32) as i16));
+        }
+    }
+    // 始终追加唯一的纯终止段
+    segs.push((0xFFFF, 0xFFFF, 1));
+
+    let nseg = segs.len();
+    let seg_x2_out = (nseg * 2) as u16;
+    let entry_sel = (nseg as u32).ilog2();
+    let search_range = ((1u32 << entry_sel) as u16) * 2;
+    let range_shift = seg_x2_out - search_range;
+
+    let mut out = Vec::with_capacity(16 + nseg * 8);
+    out.extend_from_slice(&4u16.to_be_bytes());
+    out.extend_from_slice(&[0, 0]); // length 占位，最后回填
+    out.extend_from_slice(&0u16.to_be_bytes()); // language
+    out.extend_from_slice(&seg_x2_out.to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&(entry_sel as u16).to_be_bytes());
+    out.extend_from_slice(&range_shift.to_be_bytes());
+    for &(_, e, _) in &segs {
+        out.extend_from_slice(&e.to_be_bytes());
+    }
+    out.extend_from_slice(&0u16.to_be_bytes()); // reservedPad
+    for &(s, _, _) in &segs {
+        out.extend_from_slice(&s.to_be_bytes());
+    }
+    for &(_, _, d) in &segs {
+        out.extend_from_slice(&d.to_be_bytes());
+    }
+    for _ in 0..nseg {
+        out.extend_from_slice(&0u16.to_be_bytes());
+    }
+    let length_out = out.len() as u16;
+    out[2..4].copy_from_slice(&length_out.to_be_bytes());
+    Ok(out)
+}
+
+/// 重建 vmtx 表，使其长度覆盖全部字形
+/// （OTS 要求表长度与 numberOfVMetrics / numGlyphs 匹配，否则报
+/// "vmtx: Failed to read side bearing" / "vmtx: Failed to parse table"）。
+/// 缺失的 side bearing 用最后一个已知值填充。
+fn rebuild_vmtx_table(vmtx_raw: &[u8], nvm: usize, num_glyphs: usize) -> Vec<u8> {
+    let total = nvm * 4 + (num_glyphs - nvm) * 2;
+    let mut out = Vec::with_capacity(total);
+    // 完整度量（advanceHeight + topSideBearing）
+    let metrics_bytes = nvm * 4;
+    let copy = vmtx_raw.len().min(metrics_bytes);
+    out.extend_from_slice(&vmtx_raw[..copy]);
+    out.resize(metrics_bytes, 0);
+    // 剩余字形的 side bearing
+    let sb = &vmtx_raw[metrics_bytes.min(vmtx_raw.len())..];
+    let n_avail = sb.len() / 2;
+    let mut last: i16 = 0;
+    for i in 0..(num_glyphs - nvm) {
+        let v = if i < n_avail {
+            let val = i16::from_be_bytes([sb[i * 2], sb[i * 2 + 1]]);
+            last = val;
+            val
+        } else {
+            last
+        };
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
 pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
     if raw.len() < 12 {
         bail!("File too short to be a valid TTF");
@@ -712,6 +951,26 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
         new_hmtx.extend_from_slice(&lsb.to_be_bytes());
     }
 
+    // 修复 vmtx/vhea：重建 vmtx 使其长度覆盖全部字形
+    // （否则 OTS 报 "vmtx: Failed to read side bearing"），并保持 numberOfVMetrics 一致。
+    let (new_vhea, new_vmtx) = if let (Some(vhea_raw), Some(vmtx_raw)) =
+        (orig_tables.get(b"vhea".as_slice()), orig_tables.get(b"vmtx".as_slice()))
+    {
+        if vhea_raw.len() >= 36 && !vmtx_raw.is_empty() {
+            let mut nvm = u16::from_be_bytes([vhea_raw[34], vhea_raw[35]]) as usize;
+            let mut fixed_vhea = vhea_raw.to_vec();
+            if nvm > num_glyphs {
+                nvm = num_glyphs;
+                fixed_vhea[34..36].copy_from_slice(&(nvm as u16).to_be_bytes());
+            }
+            (Some(fixed_vhea), Some(rebuild_vmtx_table(vmtx_raw, nvm, num_glyphs)))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     let mut new_hhea = hhea_raw.to_vec();
     let num_glyphs_u16 = num_glyphs as u16;
     new_hhea[34..36].copy_from_slice(&num_glyphs_u16.to_be_bytes());
@@ -753,6 +1012,30 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
             tables_map.insert(b"head", new_head.clone());
         } else if *tag == b"maxp" {
             tables_map.insert(b"maxp", new_maxp.clone());
+        } else if *tag == b"cmap" {
+            // 重建 cmap：修复 format 4 多个 0xFFFF 终止段（OTS 报错）
+            tables_map.insert(b"cmap", rebuild_cmap_table(data)?);
+        } else if *tag == b"gasp" {
+            // OTS 要求 gasp 版本号为 1（否则报 "Changed the version number to 1"）
+            if data.len() >= 4 {
+                let mut fixed_gasp = data.to_vec();
+                fixed_gasp[0..2].copy_from_slice(&1u16.to_be_bytes());
+                tables_map.insert(b"gasp", fixed_gasp);
+            } else if !data.is_empty() {
+                tables_map.insert(tag, data.to_vec());
+            }
+        } else if *tag == b"vhea" {
+            if let Some(v) = &new_vhea {
+                tables_map.insert(b"vhea", v.clone());
+            } else if !data.is_empty() {
+                tables_map.insert(tag, data.to_vec());
+            }
+        } else if *tag == b"vmtx" {
+            if let Some(v) = &new_vmtx {
+                tables_map.insert(b"vmtx", v.clone());
+            } else if !data.is_empty() {
+                tables_map.insert(tag, data.to_vec());
+            }
         } else if *tag == b"post" {
             // 修复 post 表：转换为 3.0 版本（无 glyph 名称），避免 numGlyphs 不匹配
             if data.len() >= 32 {
