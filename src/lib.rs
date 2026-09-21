@@ -1,8 +1,40 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, HashMap};
 
+mod assets;
+mod color;
+pub mod ots;
+
+pub use assets::{extract_eimg_frames, EimgFrame};
+
 const X_OFF: i32 = 128;
 const Y_OFF: i32 = 92;
+
+/// 转换开关。`Default` 保持与旧版 `convert_ftf` 完全一致（不带彩色）。
+#[derive(Debug, Clone, Default)]
+pub struct ConvertOptions {
+    /// 生成彩色字体：从 `brsh` / `cglf` 私有表推导出 `COLR` v1 + `CPAL` v0，
+    /// 并丢弃随之无用的私有表。
+    pub color: bool,
+    /// 额外强制上色的字符。
+    ///
+    /// `cglf` 的组记录只覆盖「数字/字母」这类成组的字形；QQ 皮肤里还有一小撮
+    /// 零散汉字（如 54981 的 `想生联合狩猎塔罗之`）会被上色，而这份逐字清单
+    /// **不在字体文件里**（`name`/`post`/`csty`/`assy`/`sgrp`/注解表全部排查过）。
+    /// 想 1:1 复现时把那些字符传进来即可。
+    pub color_chars: Option<Vec<char>>,
+}
+
+/// 这些是 QQ 私有表。开启彩色输出时它们已被转换成标准 `COLR`/`CPAL`
+/// （或是与静态字形无关的动画/场景数据），因此不再保留。
+fn is_private_color_table(tag: &[u8]) -> bool {
+    [
+        b"brsh", b"cglf", b"eimg", b"scen", b"asst", b"smap", b"fpid",
+        b"ganm", b"vgrp", b"vsty", b"csty", b"assy", b"sgrp",
+    ]
+    .iter()
+    .any(|t| t.as_slice() == tag)
+}
 
 #[derive(Debug, Clone)]
 struct SubRecord {
@@ -659,6 +691,89 @@ fn rebuild_cmap_table(cmap_raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// 在 `cmap` 里查一个码点对应的字形 id（支持 format 4 / 12），用于 `ConvertOptions::color_chars`。
+fn cmap_lookup(cmap_raw: &[u8], cp: u32) -> Option<u16> {
+    fn u16_at(b: &[u8], o: usize) -> Option<u16> {
+        Some(u16::from_be_bytes([*b.get(o)?, *b.get(o + 1)?]))
+    }
+    fn u32_at(b: &[u8], o: usize) -> Option<u32> {
+        Some(u32::from_be_bytes([
+            *b.get(o)?,
+            *b.get(o + 1)?,
+            *b.get(o + 2)?,
+            *b.get(o + 3)?,
+        ]))
+    }
+
+    if cmap_raw.len() < 4 {
+        return None;
+    }
+    let ntab = usize::from(u16_at(cmap_raw, 2)?);
+    for i in 0..ntab {
+        let rec = 4 + i * 8;
+        let Some(off) = u32_at(cmap_raw, rec + 4).map(|o| o as usize) else {
+            continue;
+        };
+        let Some(sub) = cmap_raw.get(off..) else {
+            continue;
+        };
+        match u16_at(sub, 0) {
+            Some(4) if cp <= 0xFFFF => {
+                let (Some(length), Some(seg_x2)) = (u16_at(sub, 2), u16_at(sub, 6)) else {
+                    continue;
+                };
+                let (length, seg_x2) = (usize::from(length), usize::from(seg_x2));
+                let segments = seg_x2 / 2;
+                if segments == 0 || length > sub.len() {
+                    continue;
+                }
+                let (end_off, start_off) = (14usize, 16 + seg_x2);
+                let (delta_off, range_off) = (start_off + seg_x2, start_off + 2 * seg_x2);
+                let cp16 = cp as u16;
+                for s in 0..segments {
+                    let (Some(end), Some(start)) =
+                        (u16_at(sub, end_off + s * 2), u16_at(sub, start_off + s * 2))
+                    else {
+                        break;
+                    };
+                    if cp16 < start || cp16 > end {
+                        continue;
+                    }
+                    let delta = i16::from_be_bytes([
+                        sub[delta_off + s * 2],
+                        sub[delta_off + s * 2 + 1],
+                    ]);
+                    let ro = u16_at(sub, range_off + s * 2)?;
+                    let gid = if ro == 0 {
+                        cp16.wrapping_add(delta as u16)
+                    } else {
+                        let at = range_off + s * 2 + usize::from(ro) + 2 * usize::from(cp16 - start);
+                        u16_at(sub, at)?.wrapping_add(delta as u16)
+                    };
+                    return (gid != 0).then_some(gid);
+                }
+            }
+            Some(12) => {
+                let ngroups = u32_at(sub, 12)? as usize;
+                for g in 0..ngroups {
+                    let o = 16 + g * 12;
+                    let (Some(hi), Some(lo), Some(base)) =
+                        (u32_at(sub, o), u32_at(sub, o + 4), u32_at(sub, o + 8))
+                    else {
+                        break;
+                    };
+                    if cp < hi || cp > lo {
+                        continue;
+                    }
+                    return u16::try_from(base + (cp - hi)).ok().filter(|gid| *gid != 0);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// 重建 cmap format 4 子表：解码为 (码点 -> glyph) 映射后重新编码。
 /// 排除非字符 U+FFFF，并始终追加标准的纯终止段 [0xFFFF, 0xFFFF, 1]。
 /// 若表本身已满足 OTS 要求（恰好一个 0xFFFF 终止段且在末尾），则原样返回。
@@ -831,6 +946,11 @@ fn rebuild_vmtx_table(vmtx_raw: &[u8], nvm: usize, num_glyphs: usize) -> Vec<u8>
 }
 
 pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
+    convert_ftf_with(raw, &ConvertOptions::default())
+}
+
+/// 与 [`convert_ftf`] 相同，但可以额外请求彩色字体输出。
+pub fn convert_ftf_with(raw: &[u8], opts: &ConvertOptions) -> Result<Vec<u8>> {
     if raw.len() < 12 {
         bail!("File too short to be a valid TTF");
     }
@@ -953,6 +1073,29 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
         }
     };
 
+    // 彩色字体：把 brsh（颜料）+ cglf（逐组选笔）编译成 COLR v1 / CPAL v0。
+    // cglf 的组记录给定「哪些字形有色 + 用哪支笔」，解不出来时回退到全字形上色（详见 color.rs）。
+    let color_tables = if opts.color {
+        let paints = orig_tables
+            .get(b"brsh".as_slice())
+            .map(|b| color::parse_brsh(b))
+            .unwrap_or_default();
+        let cglf = orig_tables
+            .get(b"cglf".as_slice())
+            .and_then(|b| color::parse_cglf_brush(b, num_glyphs));
+        // QQ 皮肤端的逐字色清单不在字体里，只能由调用方传入。
+        let forced: Vec<u16> = match (&opts.color_chars, orig_tables.get(b"cmap".as_slice())) {
+            (Some(chars), Some(raw)) => chars
+                .iter()
+                .filter_map(|c| cmap_lookup(raw, *c as u32))
+                .collect(),
+            _ => Vec::new(),
+        };
+        color::build_color_tables(&paints, cglf.as_deref(), &glyph_bboxes, num_glyphs, &forced)
+    } else {
+        None
+    };
+
     let mut new_hmtx = Vec::with_capacity(num_glyphs * 4);
     for (i, bbox) in glyph_bboxes.iter().enumerate().take(num_glyphs) {
         let (adv, _) = get_orig_hmtx(i);
@@ -1023,6 +1166,9 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
         if *tag == b"FTFG" || *tag == b"FTFH" || *tag == b"glyf" || *tag == b"loca" {
             continue;
         }
+        if color_tables.is_some() && is_private_color_table(tag) {
+            continue;
+        }
         if *tag == b"hmtx" {
             tables_map.insert(b"hmtx", new_hmtx.clone());
         } else if *tag == b"hhea" {
@@ -1074,6 +1220,10 @@ pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
     }
     tables_map.insert(b"glyf", glyf_bytes);
     tables_map.insert(b"loca", loca_bytes);
+    if let Some(ct) = &color_tables {
+        tables_map.insert(b"COLR", ct.colr.clone());
+        tables_map.insert(b"CPAL", ct.cpal.clone());
+    }
 
     let out_num_tables = tables_map.len() as u16;
     let entry_selector = (out_num_tables as f64).log2().floor() as u16;

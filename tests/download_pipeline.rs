@@ -73,33 +73,33 @@ fn test_download_extract_convert_pipeline() {
 
         println!("Downloading...");
         let zip_data = download_file(&resource.url)
-            .expect(&format!("Failed to download font {}", id));
+            .unwrap_or_else(|_| panic!("Failed to download font {}", id));
         println!("✓ Downloaded {} bytes", zip_data.len());
 
         let extract_dir = tmp_dir.join(format!("{}_extracted", id));
         println!("Extracting to {:?}...", extract_dir);
         let ttf_files = extract_zip(&zip_data, &extract_dir)
-            .expect(&format!("Failed to extract font {}", id));
+            .unwrap_or_else(|_| panic!("Failed to extract font {}", id));
         println!("✓ Extracted {} TTF file(s)", ttf_files.len());
 
         for ttf_path in ttf_files {
             println!("Converting: {}", ttf_path);
             let input_data = fs::read(&ttf_path)
-                .expect(&format!("Failed to read {}", ttf_path));
+                .unwrap_or_else(|_| panic!("Failed to read {}", ttf_path));
 
             let output_path = format!("{}_converted.ttf", ttf_path.trim_end_matches(".ttf"));
 
             match convert_ftf(&input_data) {
                 Ok(output_data) => {
                     fs::write(&output_path, output_data.clone())
-                        .expect(&format!("Failed to write {}", output_path));
+                        .unwrap_or_else(|_| panic!("Failed to write {}", output_path));
 
                     println!("✓ Converted successfully");
                     println!("  Input size:  {} bytes", input_data.len());
                     println!("  Output size: {} bytes", output_data.len());
                     println!("  Output file: {}", output_path);
 
-                    assert!(output_data.len() > 0, "Output should not be empty");
+                    assert!(!output_data.is_empty(), "Output should not be empty");
                     assert!(
                         output_data.starts_with(&[0x00, 0x01, 0x00, 0x00]),
                         "Output should have valid TTF header"
