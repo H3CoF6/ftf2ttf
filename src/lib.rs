@@ -945,7 +945,62 @@ fn rebuild_vmtx_table(vmtx_raw: &[u8], nvm: usize, num_glyphs: usize) -> Vec<u8>
     out
 }
 
+/// 重建 `hdmx` 表：QQ 把每条 DeviceRecord 填充到 8 字节对齐，
+/// 于是 `sizeDeviceRecord - (numGlyphs + 2)` 达到 5，OTS 直接报
+/// "hdmx: Bad DeviceRecord padding 5" 并拒绝整个字体。
+/// OTS 只接受 padding ≤ 3（记录按 4 字节对齐），所以这里按
+/// `numGlyphs + 2` 重新对齐记录步长，逐条搬移 widths。
+fn rebuild_hdmx_table(hdmx_raw: &[u8], num_glyphs: usize) -> Vec<u8> {
+    if hdmx_raw.len() < 8 {
+        return hdmx_raw.to_vec();
+    }
+    let version = u16::from_be_bytes([hdmx_raw[0], hdmx_raw[1]]);
+    let num_records = u16::from_be_bytes([hdmx_raw[2], hdmx_raw[3]]) as usize;
+    let size_dev =
+        u32::from_be_bytes([hdmx_raw[4], hdmx_raw[5], hdmx_raw[6], hdmx_raw[7]]) as usize;
+    let rec_len = num_glyphs + 2;
+    // 已经满足 OTS 的 padding ≤ 3 时原样保留。
+    if size_dev < rec_len || size_dev - rec_len <= 3 {
+        return hdmx_raw.to_vec();
+    }
+    let pad = (4 - rec_len % 4) % 4;
+    let stride = rec_len + pad;
+    let mut out = Vec::with_capacity(8 + num_records * stride);
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(&(num_records as u16).to_be_bytes());
+    out.extend_from_slice(&(stride as u32).to_be_bytes());
+    for k in 0..num_records {
+        let base = 8 + k * size_dev;
+        if base + rec_len > hdmx_raw.len() {
+            return hdmx_raw.to_vec();
+        }
+        out.extend_from_slice(&hdmx_raw[base..base + rec_len]);
+        out.extend_from_slice(&vec![0u8; pad]);
+    }
+    out
+}
+
+/// 重建 `LTSH` 表：表头的 numGlyphs 必须等于 `maxp.numGlyphs`，
+/// 否则 OTS "LTSH: Bad numGlyphs: N" 丢弃该表（字体的线性阈值信息丢失）。
+/// QQ 的计数会偏大（多出几个），这里改写为真实字形数并按需截断/补齐。
+fn rebuild_ltsh_table(ltsh_raw: &[u8], num_glyphs: usize) -> Vec<u8> {
+    if ltsh_raw.len() < 4 {
+        return ltsh_raw.to_vec();
+    }
+    let version = u16::from_be_bytes([ltsh_raw[0], ltsh_raw[1]]);
+    let avail = ltsh_raw.len() - 4;
+    let copy = avail.min(num_glyphs);
+    let mut out = Vec::with_capacity(4 + num_glyphs);
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(&(num_glyphs as u16).to_be_bytes());
+    out.extend_from_slice(&ltsh_raw[4..4 + copy]);
+    let last = ltsh_raw.last().copied().unwrap_or(1);
+    out.resize(4 + num_glyphs, last);
+    out
+}
+
 pub fn convert_ftf(raw: &[u8]) -> Result<Vec<u8>> {
+
     convert_ftf_with(raw, &ConvertOptions::default())
 }
 
@@ -1201,6 +1256,12 @@ pub fn convert_ftf_with(raw: &[u8], opts: &ConvertOptions) -> Result<Vec<u8>> {
             } else if !data.is_empty() {
                 tables_map.insert(tag, data.to_vec());
             }
+        } else if *tag == b"hdmx" {
+            // OTS: padding 必须 ≤ 3（详见 rebuild_hdmx_table）
+            tables_map.insert(b"hdmx", rebuild_hdmx_table(data, num_glyphs));
+        } else if *tag == b"LTSH" {
+            // OTS: numGlyphs 必须等于 maxp.numGlyphs（详见 rebuild_ltsh_table）
+            tables_map.insert(b"LTSH", rebuild_ltsh_table(data, num_glyphs));
         } else if *tag == b"post" {
             // 修复 post 表：转换为 3.0 版本（无 glyph 名称），避免 numGlyphs 不匹配
             if data.len() >= 32 {
@@ -1282,4 +1343,125 @@ pub fn convert_ftf_with(raw: &[u8], opts: &ConvertOptions) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod hdmx_ltsh_tests {
+    use super::*;
+
+    /// 构造一张「记录被 8 字节对齐」的坏 hdmx：numGlyphs=6 → rec=8，padding=2，
+    /// 但如果原始 stride 是 16，padding 就是 10（>3，OTS 会拒绝）。
+    fn bad_hdmx(num_records: usize, num_glyphs: usize, stride: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&(num_records as u16).to_be_bytes());
+        out.extend_from_slice(&(stride as u32).to_be_bytes());
+        for r in 0..num_records {
+            out.push(9 + r as u8); // pixel size（递增，满足 OTS 排序要求）
+            out.push(12 + r as u8); // max width
+            out.extend(std::iter::repeat_n((r as u8), num_glyphs));
+            out.resize(out.len() + (stride - 2 - num_glyphs), 0);
+        }
+        out
+    }
+
+    fn hdmx_pad(table: &[u8], num_glyphs: usize) -> usize {
+        let stride = u32::from_be_bytes([table[4], table[5], table[6], table[7]]) as usize;
+        stride - (num_glyphs + 2)
+    }
+
+    #[test]
+    fn hdmx_padding_is_capped_at_three() {
+        let num_glyphs = 6;
+        let raw = bad_hdmx(3, num_glyphs, 16);
+        assert!(hdmx_pad(&raw, num_glyphs) > 3);
+
+        let fixed = rebuild_hdmx_table(&raw, num_glyphs);
+        assert!(hdmx_pad(&fixed, num_glyphs) <= 3);
+        // 保留 record 数与每条 widths
+        assert_eq!(
+            u16::from_be_bytes([fixed[2], fixed[3]]) as usize,
+            3
+        );
+        for r in 0..3 {
+            let stride = (num_glyphs + 2).div_ceil(4) * 4;
+            let base = 8 + r * stride;
+            assert_eq!(fixed[base], 9 + r as u8);
+            assert_eq!(fixed[base + 1], 12 + r as u8);
+        }
+    }
+
+    #[test]
+    fn hdmx_already_valid_is_untouched() {
+        let num_glyphs = 6;
+        let raw = bad_hdmx(2, num_glyphs, num_glyphs + 2); // padding = 0
+        let fixed = rebuild_hdmx_table(&raw, num_glyphs);
+        assert_eq!(fixed, raw);
+    }
+
+    #[test]
+    fn ltsh_num_glyphs_is_clamped_to_maxp() {
+        // 表头写 9，但真实 numGlyphs 是 6 → OTS 会 "Bad numGlyphs" 丢弃
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&0u16.to_be_bytes());
+        raw.extend_from_slice(&9u16.to_be_bytes());
+        raw.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let fixed = rebuild_ltsh_table(&raw, 6);
+        assert_eq!(u16::from_be_bytes([fixed[2], fixed[3]]), 6);
+        assert_eq!(fixed.len(), 4 + 6);
+        assert_eq!(&fixed[4..], &[1, 2, 3, 4, 5, 6]);
+
+        // 反向：表头偏小则用最后一个值补齐
+        let mut small = Vec::new();
+        small.extend_from_slice(&0u16.to_be_bytes());
+        small.extend_from_slice(&2u16.to_be_bytes());
+        small.extend_from_slice(&[7, 8]);
+        let fixed = rebuild_ltsh_table(&small, 5);
+        assert_eq!(u16::from_be_bytes([fixed[2], fixed[3]]), 5);
+        assert_eq!(&fixed[4..], &[7, 8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn sample_font_33910_gets_valid_hdmx_and_ltsh() {
+        let raw = match std::fs::read("resources/33910/33910.ttf") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let converted = convert_ftf(&raw).expect("convert 33910");
+        let n = u16::from_be_bytes([converted[4], converted[5]]) as usize;
+        let mut maxp_glyphs = 0usize;
+        let mut hdmx = None;
+        let mut ltsh = None;
+        for i in 0..n {
+            let o = 12 + i * 16;
+            let tag = &converted[o..o + 4];
+            let off = u32::from_be_bytes([
+                converted[o + 8],
+                converted[o + 9],
+                converted[o + 10],
+                converted[o + 11],
+            ]) as usize;
+            let len = u32::from_be_bytes([
+                converted[o + 12],
+                converted[o + 13],
+                converted[o + 14],
+                converted[o + 15],
+            ]) as usize;
+            let data = &converted[off..off + len];
+            match tag {
+                b"maxp" => maxp_glyphs = u16::from_be_bytes([data[4], data[5]]) as usize,
+                b"hdmx" => hdmx = Some(data.to_vec()),
+                b"LTSH" => ltsh = Some(data.to_vec()),
+                _ => {}
+            }
+        }
+        let hdmx = hdmx.expect("hdmx table present in 33910");
+        assert!(
+            hdmx_pad(&hdmx, maxp_glyphs) <= 3,
+            "hdmx padding still too large: {}",
+            hdmx_pad(&hdmx, maxp_glyphs)
+        );
+        let ltsh = ltsh.expect("LTSH table present in 33910");
+        assert_eq!(u16::from_be_bytes([ltsh[2], ltsh[3]]) as usize, maxp_glyphs);
+    }
 }
