@@ -1,22 +1,33 @@
 //! 导出 QQ「炫彩/场景字体」私有表 `eimg` 中内嵌的 PNG 帧序列。
 //!
-//! 这里只做「把图片拿出来」，不做动画编排逆向。`eimg` 的表结构（实测 20405）：
+//! 这里只做「把图片拿出来」，不做动画编排逆向。`eimg` 的表结构（实测 20268 /
+//! 20338 / 20405）：
 //!
 //! ```text
-//! offset 0   u32  version = 0x00010000
-//! offset 4   u16  count         帧槽位数（20405 = 110）
-//! offset 6   ...                保留字段，到 offset 20 为止
-//! offset 20  u32[count + 1]     相对偏移表（基准 base 由首帧位置反推）
-//! 之后        帧块              每块以 PNG 签名为起始
+//! offset 0            u32  version = 0x00010000（4 字节之后是 u16 count + u16 0）
+//! offset 4            u16  count         帧槽位数（20268 = 125、20338 = 136、20405 = 110）
+//! offset 6            ...                保留字段，到 offset 16 为止
+//! offset 16           u32[count + 1]     相对偏移表（相对下面的 base）
+//! table_end           32 字节            编排记录，**基准 base 在它之后**（见下）
+//! table_end + 32      数据区              每槽一块，通常以 PNG 签名开头
 //! ```
 //!
-//! 注意：槽位数可能大于实际图片数（有的槽位不是 PNG），所以这里只导出真正以
-//! PNG 签名开头、且能完整走到 `IEND` 的块，并保留其槽位序号。
+//! `base` 不能靠「首个 PNG 签名 - offsets[0]」反推：20405 的数据区**第 0 槽是一段
+//! 32 字节的编排记录**（和 table_end 处那条同形状），首个 PNG 落在第 1 槽，于是
+//! 反推出来的 base 高了 32 字节、整张表错位，一帧都取不到（实测修复前 0 帧、
+//! 修复后 109 帧）。所以 base 优先按表几何算（`table_end + 32`），并用「偏移表里
+//! 有多少个值正好落在 PNG 签名上」跟旧的签名反推法比一比，取更准的那个。
+//!
+//! 注意：槽位数可能大于实际图片数 —— 20405 的 count 是 110、真图只有 109 张。
+//! 这里只导出真正以 PNG 签名开头、且能完整走到 `IEND` 的块，并保留其槽位序号。
 
 use anyhow::{bail, Result};
 
 /// PNG 文件签名。
 const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
+/// 偏移表与数据区之间那 32 字节编排记录的长度（三个实测样本都是 32）。
+const INDEX_TAIL_LEN: usize = 32;
 
 /// `eimg` 中的一帧图片。
 #[derive(Debug, Clone)]
@@ -84,24 +95,22 @@ fn extract_frames_from_eimg(eimg: &[u8]) -> Result<Vec<EimgFrame>> {
     if count == 0 {
         return Ok(Vec::new());
     }
-    let idx_end = 20 + 4 * (count + 1);
+    let idx_start = 16;
+    let idx_end = idx_start + 4 * (count + 1);
     if eimg.len() < idx_end {
         return Ok(Vec::new());
     }
 
     let offsets: Vec<u64> = (0..=count)
         .map(|k| {
-            let o = 20 + 4 * k;
+            let o = idx_start + 4 * k;
             u32::from_be_bytes([eimg[o], eimg[o + 1], eimg[o + 2], eimg[o + 3]]) as u64
         })
         .collect();
 
-    // 偏移表里的值是相对的，基准 base 用「首帧 PNG 签名位置 - offsets[0]」反推，
-    // 这样不依赖任何写死的常量。
-    let Some(first_sig) = find_png_signature(eimg, idx_end) else {
+    let Some(base) = data_base(eimg, idx_end, &offsets) else {
         return Ok(Vec::new());
     };
-    let base = first_sig as i64 - offsets[0] as i64;
 
     let mut frames = Vec::new();
     for slot in 0..count {
@@ -129,6 +138,51 @@ fn extract_frames_from_eimg(eimg: &[u8]) -> Result<Vec<EimgFrame>> {
         }
     }
     Ok(frames)
+}
+
+/// 数据区的基准：偏移表里每个值都是相对它的（见文件头）。
+///
+/// 两个候选各按「偏移表里有多少个值正好指向 PNG 签名」打分，取高的那个；同分时
+/// 优先表几何法 —— 20405 那种「第 0 槽不是图片」的字体只有它能全中，而 20268 /
+/// 20338 两种算法结果一致，不会因此改变行为。
+fn data_base(eimg: &[u8], table_end: usize, offsets: &[u64]) -> Option<i64> {
+    let hits = |base: i64| -> Option<usize> {
+        if base < 0 {
+            return None;
+        }
+        Some(
+            offsets
+                .iter()
+                .filter(|&&off| matches_png_sig_at(eimg, base + off as i64))
+                .count(),
+        )
+    };
+
+    let geometry = i64::try_from(table_end + INDEX_TAIL_LEN)
+        .ok()
+        .and_then(|base| hits(base).map(|score| (score, base)));
+    let legacy = find_png_signature(eimg, table_end)
+        .map(|sig| sig as i64 - offsets[0] as i64)
+        .and_then(|base| hits(base).map(|score| (score, base)));
+
+    match (geometry, legacy) {
+        (Some((geo, geo_base)), Some((old, old_base))) => {
+            Some(if old > geo { old_base } else { geo_base })
+        }
+        (Some((_, base)), None) | (None, Some((_, base))) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// `at` 处是不是一张图的 PNG 签名。
+fn matches_png_sig_at(data: &[u8], at: i64) -> bool {
+    let Some(start) = usize::try_from(at).ok() else {
+        return false;
+    };
+    match start.checked_add(PNG_SIG.len()) {
+        Some(end) if end <= data.len() => data[start..end] == PNG_SIG,
+        _ => false,
+    }
 }
 
 fn find_png_signature(data: &[u8], from: usize) -> Option<usize> {
@@ -188,6 +242,20 @@ mod tests {
         0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
 
+    /// 把一个 `eimg` 表包进最小的单表 SFNT 容器，供各用例复用。
+    fn wrap_eimg(eimg: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        raw.extend_from_slice(&1u16.to_be_bytes()); // numTables
+        raw.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        raw.extend_from_slice(b"eimg");
+        raw.extend_from_slice(&0u32.to_be_bytes()); // checksum
+        raw.extend_from_slice(&(28u32).to_be_bytes()); // offset
+        raw.extend_from_slice(&(eimg.len() as u32).to_be_bytes());
+        raw.extend_from_slice(eimg);
+        raw
+    }
+
     #[test]
     fn png_len_rejects_garbage() {
         assert!(png_total_len(b"not a png").is_none());
@@ -202,7 +270,7 @@ mod tests {
     #[test]
     fn extracts_frames_from_minimal_eimg() {
         let count: u16 = 2;
-        let header_len = 20usize + 4 * (count as usize + 1);
+        let header_len = 16usize + 4 * (count as usize + 1);
         let data_start = 32usize; // 偏移表之后留一点空隙模拟真实结构
 
         let mut eimg = vec![0u8; header_len];
@@ -213,29 +281,58 @@ mod tests {
         // 槽位 0 = PNG，槽位 1 = 非 PNG（应被跳过）
         let offs = [0u32, TINY_PNG.len() as u32, TINY_PNG.len() as u32 + 4];
         for (k, o) in offs.iter().enumerate() {
-            let at = 20 + 4 * k;
+            let at = 16 + 4 * k;
             eimg[at..at + 4].copy_from_slice(&o.to_be_bytes());
         }
         eimg.resize(data_start, 0);
         eimg.extend_from_slice(&TINY_PNG);
         eimg.extend_from_slice(b"skip");
 
-        // 用 eimg 组装一个最小 SFNT
-        let mut raw = Vec::new();
-        raw.extend_from_slice(&0x0001_0000u32.to_be_bytes());
-        raw.extend_from_slice(&1u16.to_be_bytes()); // numTables
-        raw.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-        raw.extend_from_slice(b"eimg");
-        raw.extend_from_slice(&0u32.to_be_bytes()); // checksum
-        raw.extend_from_slice(&(28u32).to_be_bytes()); // offset
-        raw.extend_from_slice(&(eimg.len() as u32).to_be_bytes());
-        raw.extend_from_slice(&eimg);
-
-        let frames = extract_eimg_frames(&raw).expect("extract");
+        let frames = extract_eimg_frames(&wrap_eimg(&eimg)).expect("extract");
         assert_eq!(frames.len(), 1, "only the PNG slot should be exported");
         assert_eq!(frames[0].slot, 0);
         assert_eq!((frames[0].width, frames[0].height), (1, 1));
         assert_eq!(frames[0].png, TINY_PNG);
+    }
+
+    /// 回归：20405 那类「数据区第 0 槽不是图片」的布局（修复前实测导出 0 帧）。
+    ///
+    /// 首个 PNG 落在第 1 槽，用「首帧签名 - offsets[0]」反推基准会整体高 32 字节，
+    /// 整张表随之错位。这里靠表几何（table_end + 32）拿回正确基准。
+    #[test]
+    fn extracts_frames_when_first_slot_is_not_a_png() {
+        let count: u16 = 3; // 槽 0 = 编排记录，槽 1/2 = 图片
+        let table_end = 16usize + 4 * (count as usize + 1);
+        let record = [0u8; INDEX_TAIL_LEN];
+
+        let mut eimg = vec![0u8; table_end];
+        eimg[1] = 0x01; // version = 0x0001_0000
+        eimg[4..6].copy_from_slice(&count.to_be_bytes());
+
+        // 偏移相对数据区起点：槽 0 是记录，槽 1、2 各一张图。
+        let offs = [
+            0u32,
+            INDEX_TAIL_LEN as u32,
+            (INDEX_TAIL_LEN + TINY_PNG.len()) as u32,
+            (INDEX_TAIL_LEN + 2 * TINY_PNG.len()) as u32,
+        ];
+        for (k, o) in offs.iter().enumerate() {
+            let at = 16 + 4 * k;
+            eimg[at..at + 4].copy_from_slice(&o.to_be_bytes());
+        }
+        eimg.extend_from_slice(&record); // 表尾的编排记录（图片区之前）
+        eimg.extend_from_slice(&record); // 数据区第 0 槽：又一条，不是图片
+        eimg.extend_from_slice(&TINY_PNG);
+        eimg.extend_from_slice(&TINY_PNG);
+
+        let frames = extract_eimg_frames(&wrap_eimg(&eimg)).expect("extract");
+        assert_eq!(frames.len(), 2, "both PNG slots should be exported");
+        assert_eq!(
+            frames.iter().map(|f| f.slot).collect::<Vec<_>>(),
+            vec![1, 2],
+            "slot numbers must survive the skipped record"
+        );
+        assert!(frames.iter().all(|f| f.png == TINY_PNG));
     }
 
     #[test]

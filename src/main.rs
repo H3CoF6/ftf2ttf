@@ -33,9 +33,13 @@ struct Cli {
     #[arg(long, value_name = "CHARS")]
     color_chars: Option<String>,
 
-    /// Export embedded eimg PNG frames (color/animation fonts) into this directory
+    /// Root directory for exported eimg PNG frames (default: `<output>_assets` next to each font)
     #[arg(long, value_name = "DIR")]
     dump_assets: Option<PathBuf>,
+
+    /// Do not export the embedded eimg frame images (they are exported by default)
+    #[arg(long)]
+    no_assets: bool,
 
     /// Validate every produced font with the local ots-sanitize (see scripts/setup-ots.sh)
     #[arg(long)]
@@ -69,22 +73,39 @@ fn run_ots(dst: &Path) -> Result<()> {
     }
 }
 
-fn process_single_file(
-    src: &Path,
-    dst: &Path,
-    cli: &Cli,
-    assets_root: Option<&Path>,
-) -> Result<()> {
+/// 图包导出目录：`--dump-assets DIR` 时是 `DIR/<字体名>`，否则默认落在产物旁边
+/// （`<输出名>_assets/`）；`--no-assets` 时完全不导出。
+fn assets_dir_for(cli: &Cli, src: &Path, dst: &Path) -> Option<PathBuf> {
+    if cli.no_assets {
+        return None;
+    }
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "font".to_string());
+    Some(match &cli.dump_assets {
+        Some(root) => root.join(&stem),
+        None => {
+            let out_stem = dst
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "font".to_string());
+            dst.with_file_name(format!("{out_stem}_assets"))
+        }
+    })
+}
+
+fn process_single_file(src: &Path, dst: &Path, cli: &Cli) -> Result<()> {
     let raw = fs::read(src).with_context(|| format!("Failed to read {:?}", src))?;
 
-    if let Some(root) = assets_root {
+    if let Some(dir) = assets_dir_for(cli, src, dst) {
         let stem = src
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "font".to_string());
-        let count = dump_eimg(&raw, &root.join(&stem))?;
+        let count = dump_eimg(&raw, &dir)?;
         if count > 0 {
-            println!("Exported {count} image(s) for {stem}");
+            println!("Exported {count} image(s) for {stem} -> {}", dir.display());
         }
     }
 
@@ -123,7 +144,7 @@ fn main() -> Result<()> {
             parent.join(format!("{}_result.ttf", stem))
         });
         println!("Converting {:?} -> {:?}", cli.input, dst);
-        process_single_file(&cli.input, &dst, &cli, cli.dump_assets.as_deref())?;
+        process_single_file(&cli.input, &dst, &cli)?;
         println!("Done in {:.2}ms", start_time.elapsed().as_secs_f64() * 1000.0);
     } else if cli.input.is_dir() {
         let out_dir = cli
@@ -155,7 +176,7 @@ fn main() -> Result<()> {
 
         println!("Found {} files to convert...", tasks.len());
         tasks.par_iter().for_each(|(src, dst)| {
-            match process_single_file(src, dst, &cli, cli.dump_assets.as_deref()) {
+            match process_single_file(src, dst, &cli) {
                 Ok(_) => println!("Converted: {:?}", src.file_name().unwrap()),
                 Err(e) => eprintln!("Error converting {:?}: {:#}", src, e),
             }

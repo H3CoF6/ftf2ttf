@@ -17,7 +17,7 @@ QQ的**部分字体**使用了自定义的格式（在 TTF 基础上添加了 FT
 - [x] 自动生成输出文件名（`原文件名_result.ttf`）
 - [x] 完整的错误处理和友好的提示信息
 - [x] 可选输出**彩色字体**：把私有 `brsh` / `cglf` 表编译成标准 `COLR` v1 + `CPAL` v0（含逐组选色）
-- [x] 可选导出**内嵌图片序列**：把私有 `eimg` 表里的 PNG 帧写到磁盘
+- [x] 默认导出**内嵌图片序列**：把私有 `eimg` 表里的 PNG 帧写到磁盘（`--no-assets` 关闭）
 - [x] 可选用本地 **OTS（OpenType Sanitizer）** 预检产物，不用等浏览器报错
 
 ## 安装
@@ -68,8 +68,9 @@ Options:
   -r, --recursive          递归转换目录（批量模式）
   -c, --color              输出彩色字体（COLR v1 + CPAL v0）
       --color-chars <CHARS> 额外强制上色的字符（QQ 皮肤的逐字清单不在字体里）
-      --dump-assets <DIR>  把 eimg 内嵌 PNG 帧序列导出到目录
-      --check-ots          用本地 ots-sanitize 校验产物
+      --dump-assets <DIR>   图包导出根目录（默认落在产物旁边：`<输出名>_assets/`）
+      --no-assets           不导出 eimg 内嵌 PNG 帧（默认导出）
+      --check-ots           用本地 ots-sanitize 校验产物
   -h, --help               显示帮助信息
 ```
 
@@ -85,12 +86,26 @@ QQ 的部分字体在 FTF 之上还挂了私有彩色表：
 # 生成彩色 TTF：@font-face 挂上即可显示彩色（Chromium/Electron 原生支持 COLRv1）
 ftf2ttf 23161.ttf -c -o 23161-color.ttf
 
-# 导出 eimg 里的图片序列：<DIR>/<字体名>/frame_000.png ...
-ftf2ttf 20405.ttf --dump-assets ./assets -o 20405.ttf
+# eimg 图包默认导出到产物旁边：foo_assets/frame_000.png ...
+ftf2ttf 20405.ttf -o 20405.ttf          # -> 20405_assets/（125 帧那种会写 100+ 张）
+ftf2ttf 20405.ttf --dump-assets ./assets # -> ./assets/20405/frame_000.png ...
+ftf2ttf 20405.ttf --no-assets            # 只要字体，不要图
 
 # 54981 的「想生联合狩猎塔罗之」不在表里，靠参数补上，得到与 QQ 一致的结果
 ftf2ttf 54981.ttf -c --color-chars '想生联合狩猎塔罗之' -o 54981-color.ttf
 ```
+
+**`eimg` 结构（实测 20268 / 20405）**：
+
+```text
+16B  头  { u32 version=0x00010000, u16 count, u16 0, u32 0, u32 0 }
+u32[count + 1]   相对偏移表（基准 base 由首帧 PNG 签名位置反推）
+帧块             每块以 PNG 签名开头，走到 IEND 结束
+```
+
+`count` 是槽位数，可能比实际图片多（有的槽位不是 PNG，会被跳过）。
+注意偏移表在 **offset 16**（不是 20）——早期按 20 对齐会整体错一位、
+丢掉最后一帧，在校验 20268 时修正。
 
 > QQ 皮肤里还有一小撮**零散汉字**会被上色（如 54981 的 `想生联合狩猎塔罗之`）。
 > 这份逐字清单**不在字体文件里**：`name`（无自定义记录）、`post`、`cglf`
